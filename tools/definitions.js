@@ -293,7 +293,7 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
             description: "Why this position is being closed. Include the rule that triggered it, e.g. 'low yield', 'stop loss', 'trailing TP', 'OOR'. Used for pool memory."
           }
         },
-        required: ["position_address"]
+        required: ["position_address", "reason"]
       }
     }
   },

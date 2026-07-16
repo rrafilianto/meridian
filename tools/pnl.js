@@ -232,6 +232,7 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     pnl_pct_diff:       pnlPctDiff != null ? round(pnlPctDiff, 2) : null,
     pnl_pct_suspicious: !!pnlPctSuspicious,
     fee_per_tvl_24h:    meteora ? Math.round(safeNum(meteora.feePerTvl24h) * 100) / 100 : null,
+    volume_24h:         meteora ? safeNum(meteora.tradeVolume24h) ?? null : null,
     age_minutes:        ageMinutes,
     minutes_out_of_range: minutesOutOfRange(f.position),
     instruction:        tracked?.instruction ?? null,

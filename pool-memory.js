@@ -345,6 +345,37 @@ export function recallForPool(poolAddress) {
   // Deploy history summary
   if (entry.total_deploys > 0) {
     lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), avg PnL ${entry.avg_pnl_pct}%, win rate ${entry.win_rate}%, last outcome: ${entry.last_outcome}`);
+    // Context about WHY past losses happened — close reasons give the signal
+    const recent = entry.deploys.slice(-3);
+    const reasons = recent.map(d => d.close_reason || "unknown").filter(Boolean);
+    if (reasons.length > 0) {
+      lines.push(`  closes: ${reasons.join(", ")}`);
+    }
+    // Check if conditions have changed vs past losing deploys
+    const losing = entry.deploys.filter(d => d.pnl_pct != null && d.pnl_pct < 0);
+    if (losing.length > 0) {
+      const lastLoss = losing[losing.length - 1];
+      const context = [];
+      if (lastLoss.close_reason) context.push(`closed: ${lastLoss.close_reason}`);
+      if (lastLoss.entry_volume != null) context.push(`entry_vol=$${lastLoss.entry_volume}`);
+      if (lastLoss.entry_tvl != null) context.push(`entry_tvl=$${lastLoss.entry_tvl}`);
+      if (lastLoss.minutes_held != null) context.push(`held=${lastLoss.minutes_held}min`);
+      if (context.length > 0) {
+        lines.push(`  last loss context: ${context.join(", ")}`);
+      }
+    }
+    // Winning deploy context for comparison
+    const winning = entry.deploys.filter(d => d.pnl_pct != null && d.pnl_pct >= 0);
+    if (winning.length > 0) {
+      const lastWin = winning[winning.length - 1];
+      const ctx = [];
+      if (lastWin.close_reason) ctx.push(`closed: ${lastWin.close_reason}`);
+      if (lastWin.entry_volume != null) ctx.push(`entry_vol=$${lastWin.entry_volume}`);
+      if (lastWin.pnl_pct != null) ctx.push(`pnl=${lastWin.pnl_pct}%`);
+      if (ctx.length > 0) {
+        lines.push(`  last win context: ${ctx.join(", ")}`);
+      }
+    }
   }
 
   if (entry.cooldown_until && new Date(entry.cooldown_until) > new Date()) {

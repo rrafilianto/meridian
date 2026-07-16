@@ -33,7 +33,7 @@ import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
-import { appendDecision } from "./decision-log.js";
+import { appendDecision, getDecisionSummary } from "./decision-log.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -152,24 +152,27 @@ function stopCronJobs() {
 }
 
 /**
- * Execute the actions decided by the deterministic rules. CLOSE/CLAIM run directly
- * via executeTool (no LLM) — preserving all post-effects (notify, auto-swap,
- * recordPerformance, decision-log, HiveMind). Only INSTRUCTION positions, whose
- * free-text condition JS can't parse, are handed to the MANAGER LLM. Returns a
- * one-line-per-position result string.
+ * Execute the actions decided by the rule engine. CLOSE/CLAIM run directly via
+ * executeTool (no LLM) — preserving all post-effects (notify, auto-swap,
+ * recordPerformance, decision-log, HiveMind). INSTRUCTION + EVAL positions are
+ * handed to the MANAGER LLM for contextual evaluation. Returns a one-line-per-
+ * position result string.
  */
 async function executeManagementActions(actionPositions, actionMap, { liveMessage = null, cur = "$" } = {}) {
   const lines = [];
-  const instructionPositions = [];
+  const llmPositions = [];
 
-  const mechanical = actionPositions.filter(p => actionMap.get(p.position).action !== "INSTRUCTION");
+  const mechanical = actionPositions.filter(p => {
+    const a = actionMap.get(p.position);
+    return a.action !== "INSTRUCTION" && a.action !== "EVAL";
+  });
   if (mechanical.length) {
     log("cron", `Management: executing ${mechanical.length} mechanical action(s) — no LLM`);
   }
 
   for (const p of actionPositions) {
     const act = actionMap.get(p.position);
-    if (act.action === "INSTRUCTION") { instructionPositions.push(p); continue; }
+    if (act.action === "INSTRUCTION" || act.action === "EVAL") { llmPositions.push(p); continue; }
 
     if (act.action === "CLOSE") {
       const reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
@@ -187,28 +190,37 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
     }
   }
 
-  // INSTRUCTION positions need the LLM to evaluate the free-text condition.
-  if (instructionPositions.length > 0) {
-    log("cron", `Management: ${instructionPositions.length} instruction position(s) — invoking LLM [model: ${config.llm.managementModel}]`);
-    const actionBlocks = instructionPositions.map((p) => [
-      `POSITION: ${p.pair} (${p.position})`,
-      `  pool: ${p.pool}`,
-      `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
-      `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-      `  instruction: "${p.instruction}"`,
-    ].join("\n")).join("\n\n");
+  // LLM evaluates INSTRUCTION + EVAL positions together
+  if (llmPositions.length > 0) {
+    const instrCount = llmPositions.filter(p => actionMap.get(p.position).action === "INSTRUCTION").length;
+    const evalCount = llmPositions.length - instrCount;
+    log("cron", `Management: ${llmPositions.length} position(s) \u2192 LLM [model: ${config.llm.managementModel}] (${instrCount} instruction, ${evalCount} eval)`);
 
-    const { content } = await agentLoop(`
-INSTRUCTION EVALUATION — ${instructionPositions.length} position(s)
+    const blocks = [];
+    for (const p of llmPositions) {
+      const act = actionMap.get(p.position);
 
-${actionBlocks}
+      if (act.action === "INSTRUCTION") {
+        blocks.push(`POSITION (INSTRUCTION): ${p.pair} (${p.position})`);
+        blocks.push(`  pool: ${p.pool}`);
+        blocks.push(`  pnl: ${p.pnl_pct}% | unclaimed: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee/TVL: ${p.fee_per_tvl_24h ?? "?"}%`);
+        blocks.push(`  bins: ${p.lower_bin}-${p.upper_bin} active=${p.active_bin} | OOR: ${p.minutes_out_of_range ?? 0}m`);
+        blocks.push(`  note: "${p.instruction}"`);
+        blocks.push(`  \u2192 If note condition is MET, call close_position. Otherwise HOLD.`);
+      } else {
+        blocks.push(`POSITION (EVAL): ${p.pair} (${p.position})`);
+        blocks.push(`  issue: ${act.reason}`);
+        blocks.push(`  pnl: ${p.pnl_pct}% | unclaimed: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee/TVL: ${p.fee_per_tvl_24h ?? "?"}% | vol: $${p.volume_24h ?? "?"}`);
+        blocks.push(`  bins: ${p.lower_bin}-${p.upper_bin} active=${p.active_bin} | OOR: ${p.minutes_out_of_range ?? 0}m`);
+        if (p.recall) blocks.push(`  pool ctx:\n${p.recall.split("\n").map(l => `    ${l}`).join("\n")}`);
+        blocks.push(`  \u2192 Decide: close_position or HOLD? BIAS TO HOLD. Only close if pool is dying or recovery is unlikely.`);
+      }
+      blocks.push("");
+    }
 
-For each position, evaluate the instruction condition against the live data:
-- If the condition is MET → call close_position (it claims fees internally; do NOT call claim_fees first).
-- If NOT met → HOLD, do nothing.
+    const prompt = `MANAGEMENT EVALUATION \u2014 ${llmPositions.length} position(s)\n\n${blocks.join("\n")}\nRULES:\n1. INSTRUCTION positions: condition MET \u2192 close_position (claims fees internally). NOT met \u2192 HOLD.\n2. EVAL positions (OOR/low yield/TP): use judgment with bias to hold.\n   - Fee/TVL still decent + volume healthy \u2192 HOLD, price may return to range\n   - Pool dying / yield collapsed / no recovery sign \u2192 close_position\n3. After ANY close: swap base tokens to SOL (if worth >= $0.10).\n4. Do NOT call claim_fees before close_position \u2014 it's handled internally.\n\nWrite one brief result line per position after acting (or HOLD).`;
 
-After evaluating, write a brief one-line result per position.
-    `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
+    const { content } = await agentLoop(prompt, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
       onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
       onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
     });
@@ -251,23 +263,28 @@ export async function runManagementCycle({ silent = false } = {}) {
     // JS exit checks. Management is the slow cron backstop: raise peak immediately
     // (confirmTicks=1) and act on detected exits directly. Real-time 2-tick
     // confirmation lives in the fast 3s poller below.
-    const exitMap = new Map();
+    const exitMap = new Map(); // position_address → { action, reason, ... }
     for (const p of positionData) {
       confirmPeak(p.position, p.pnl_pct, 1);
       const exit = updatePnlAndCheckExits(p.position, p, config.management);
       if (exit) {
-        exitMap.set(p.position, exit.reason);
+        exitMap.set(p.position, exit);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
       }
     }
 
-    // ── Deterministic rule checks (no LLM) ──────────────────────────
-    // action: CLOSE | CLAIM | STAY | INSTRUCTION (needs LLM)
+    // ── Rule checks ──────────────────────────────────────────
+    // action: CLOSE (deterministic) | EVAL (LLM) | INSTRUCTION (LLM) | CLAIM | STAY
     const actionMap = new Map();
     for (const p of positionData) {
-      // Hard exit — highest priority
+      // Exit signals — split by urgency
       if (exitMap.has(p.position)) {
-        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
+        const exit = exitMap.get(p.position);
+        if (exit.action === "STOP_LOSS" || exit.action === "TRAILING_TP") {
+          actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exit.reason });
+        } else {
+          actionMap.set(p.position, { action: "EVAL", rule: "exit", reason: exit.reason, exit_type: exit.action });
+        }
         continue;
       }
       // Instruction-set — pass to LLM, can't parse in JS
@@ -298,18 +315,19 @@ export async function runManagementCycle({ silent = false } = {}) {
       const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
-      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
+      const statusLabel = act.action === "INSTRUCTION" ? "EVAL instruction" : act.action === "EVAL" ? `EVAL (${act.reason})` : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
+      if (act.action === "EVAL") line += `\n→ ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
     });
 
     const needsAction = [...actionMap.values()].filter(a => a.action !== "STAY");
     const actionSummary = needsAction.length > 0
-      ? needsAction.map(a => a.action === "INSTRUCTION" ? "EVAL instruction" : `${a.action}${a.reason ? ` (${a.reason})` : ""}`).join(", ")
+      ? needsAction.map(a => a.action === "INSTRUCTION" ? "EVAL instruction" : a.action === "EVAL" ? `EVAL (${a.reason})` : `${a.action}${a.reason ? ` (${a.reason})` : ""}`).join(", ")
       : "no action";
 
     const cur = config.management.solMode ? "◎" : "$";
@@ -341,7 +359,8 @@ export async function runManagementCycle({ silent = false } = {}) {
     log("cron_error", `Management cycle failed: ${error.message}`);
     mgmtReport = `Management cycle failed: ${error.message}`;
   } finally {
-    _managementBusy = false;
+    // Finalize live message BEFORE releasing the busy lock — prevents race where
+    // the poller fires notifyClose while hasActiveLiveMessage() is still true.
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
@@ -353,6 +372,7 @@ export async function runManagementCycle({ silent = false } = {}) {
         }
       }
     }
+    _managementBusy = false;
   }
   return mgmtReport;
 }
@@ -420,9 +440,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change) | deposit: SOL only (amount_y, amount_x=0)`
       + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
 
-    // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
-    const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
+    // Fetch top candidates (loose mode: only safety filters, LLM does contextual filtering)
+    const topCandidates = await getTopCandidates({ limit: 25, mode: "loose" }).catch(() => null);
+    const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 25);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
 
     const allCandidates = [];
@@ -443,7 +463,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
     }
 
-    // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
+    // Safety filters after token recon — only launchpad allow/block
     const filteredOut = [];
     const passing = allCandidates.filter(({ pool, ti }) => {
       const launchpad = ti?.launchpad ?? null;
@@ -457,13 +477,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `blocked launchpad (${launchpad})` });
         return false;
       }
-      const botPct = ti?.audit?.bot_holders_pct;
-      const maxBotHoldersPct = config.screening.maxBotHoldersPct;
-      if (botPct != null && maxBotHoldersPct != null && botPct > maxBotHoldersPct) {
-        log("screening", `Bot-holder filter: dropped ${pool.name} — bots ${botPct}% > ${maxBotHoldersPct}%`);
-        filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
-        return false;
-      }
+      // Bot holders, TVL, fee ratio dll dilempar ke LLM sebagai risk signal, bukan hard filter
       return true;
     });
 
@@ -474,7 +488,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         .join("\n");
       screenReport = combinedExamples
         ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
-        : `No candidates available (all filtered by launchpad / holder-quality rules).`;
+        : `No candidates available (all filtered by launchpad rules).`;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
@@ -483,36 +497,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
         rejected: combined.slice(0, 5).map((entry) => `${entry.name}: ${entry.reason}`),
       });
       return screenReport;
-    }
-
-    if (passing.length === 1) {
-      const skipReason = getLoneCandidateSkipReason(passing[0]);
-      if (skipReason) {
-        const candidateName = passing[0].pool?.name || "unknown";
-        screenReport = [
-          "⛔ NO DEPLOY",
-          "",
-          "Cycle finished with no valid entry.",
-          "",
-          "BEST LOOKING CANDIDATE",
-          candidateName,
-          "",
-          "WHY SKIPPED",
-          `Only one candidate survived filtering, but it was not worth deploying: ${skipReason}.`,
-          "",
-          "REJECTED",
-          `- ${candidateName}: ${skipReason}`,
-        ].join("\n");
-        appendDecision({
-          type: "no_deploy",
-          actor: "SCREENER",
-          summary: "Single candidate skipped",
-          reason: skipReason,
-          pool: passing[0].pool?.pool,
-          pool_name: candidateName,
-        });
-        return screenReport;
-      }
     }
 
     // Pre-fetch active_bin for all passing candidates in parallel
@@ -531,14 +515,24 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
 
       const pvpLine = pool.is_pvp
-        ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
+        ? `  risk_pvp: rival ${pool.pvp_rival_name || pool.pvp_symbol} has pool tvl=$${pool.pvp_rival_tvl}`
         : null;
+
+      // Risk annotations — soft signals for LLM, not hard filters
+      const riskNotes = [];
+      if (botPct !== "?" && botPct > 40) riskNotes.push(`high_bots(${botPct}%)`);
+      if (top10Pct !== "?" && top10Pct > 50) riskNotes.push(`concentrated_top10(${top10Pct}%)`);
+      if (feesSol !== "?" && feesSol < 30) riskNotes.push(`low_fees(${feesSol}SOL)`);
+      if (pool.fee_active_tvl_ratio != null && pool.fee_active_tvl_ratio < 0.2) riskNotes.push(`low_fee_tvl(${pool.fee_active_tvl_ratio})`);
+      if (pool.volatility == null || pool.volatility <= 0) riskNotes.push(`no_volatility`);
+      const riskLine = riskNotes.length > 0 ? `  risks: ${riskNotes.join(", ")}` : null;
 
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
+        riskLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
@@ -567,6 +561,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
 
+    // Inject past experience into the goal so LLM can filter using lessons
+    const decisionSummary = getDecisionSummary();
+
     let deployAttempted = false;
     let deploySucceeded = false;
     const { content } = await agentLoop(`
@@ -574,18 +571,19 @@ SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
-PRE-LOADED CANDIDATES (${passing.length} pools):
+${decisionSummary ? `── PAST DECISIONS ──\n${decisionSummary}\n` : ""}${weightsSummary ? `${weightsSummary}\n` : ""}PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
 
 STEPS:
-1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
-3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
+1. Review past experience (LESSONS LEARNED, PAST DECISIONS, POOL MEMORY) above. Use them to filter candidates — patterns of loss (low yield, high bots, concentrated top10) should weigh against a candidate. Patterns of profit should boost confidence.
+2. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
+3. Pick the best candidate based on: narrative quality, smart wallets, pool memory, risk signals (bots, top10 concentration, fee ratio), and alignment with lessons from past positions.
+4. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
-4. Report in this exact format (no tables, no extra sections):
+5. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
    <pool name>
@@ -618,8 +616,8 @@ STEPS:
    Smart wallets: <names or none>
 
    WHY THIS WON
-   <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
-5. If no pool qualifies, report in this exact format instead:
+   <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives — reference past lessons if relevant>
+6. If no pool qualifies, report in this exact format instead:
    ⛔ NO DEPLOY
 
    Cycle finished with no valid entry.
@@ -628,12 +626,13 @@ STEPS:
    <name or none>
 
    WHY SKIPPED
-   <2-4 concise sentences explaining why nothing was good enough>
+   <2-4 concise sentences explaining why nothing was good enough — reference past lessons if relevant>
 
    REJECTED
    <short flat list of top candidate names and why they were skipped>
 IMPORTANT:
 - Keep the whole report compact and highly scannable for Telegram.
+- Filters like bots%, top10%, fee_ratio, TVL are now risk SIGNALS, not hard blocks. Use your judgment based on past lessons.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
@@ -667,13 +666,14 @@ IMPORTANT:
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
-    _screeningBusy = false;
+    // Finalize live message BEFORE releasing the busy lock (same race fix as management cycle).
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
         else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
       }
     }
+    _screeningBusy = false;
   }
   return screenReport;
 }
@@ -716,11 +716,10 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
-  // Fast PnL poller — the real-time exit path between management cycles, no LLM.
-  // Runs on public infra (RPC + Jupiter + Meteora deposits) so it can poll aggressively.
-  // Exits require `confirmTicks` consecutive confirming polls (registerExitSignal) so a
-  // single noisy tick can't close a position; confirmed exits close DIRECTLY here (no
-  // management-interval cooldown gate that used to swallow rule hits).
+  // Fast PnL poller — real-time exit path for urgent signals only (SL, trailing TP).
+  // Non-urgent exits (OOR, low yield, take profit) are handled by the management cycle
+  // LLM eval. Exits require confirmTicks consecutive confirming polls so a single noisy
+  // tick can't close a position; confirmed exits close DIRECTLY here.
   const pnlPollMs = Math.max(1, Number(config.pnl.pollIntervalSec ?? 3)) * 1000;
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
@@ -740,6 +739,10 @@ Summarize the current portfolio health, total fees earned, and performance of al
         let signal = null, reason = null, rule = "exit";
         if (exit) { signal = exit.action; reason = exit.reason; }
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
+
+        // Non-urgent signals (OOR/low yield) and EVAL rules skip the fast poller
+        if (exit && (exit.action === "OUT_OF_RANGE" || exit.action === "LOW_YIELD")) continue;
+        if (closeRule && closeRule.action === "EVAL") continue;
 
         // Require N consecutive confirming ticks before acting.
         const { fire } = registerExitSignal(p.position, signal, confirmTicks);
@@ -915,7 +918,7 @@ function getDeterministicCloseRule(position, managementConfig) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
-    return { action: "CLOSE", rule: 2, reason: "take profit" };
+    return { action: "EVAL", rule: 2, reason: "take profit" };
   }
   if (
     position.active_bin != null &&
@@ -930,14 +933,14 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.active_bin > position.upper_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
-    return { action: "CLOSE", rule: 4, reason: "OOR" };
+    return { action: "EVAL", rule: 4, reason: "OOR" };
   }
   if (
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
     (position.age_minutes ?? 0) >= 60
   ) {
-    return { action: "CLOSE", rule: 5, reason: "low yield" };
+    return { action: "EVAL", rule: 5, reason: "low yield" };
   }
   return null;
 }

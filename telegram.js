@@ -1,6 +1,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
+import { config } from "./config.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 
@@ -483,12 +484,14 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
+export async function notifyClose({ pair, pnlUsd, pnlPct, reason }) {
   if (hasActiveLiveMessage()) return;
   const sign = pnlUsd >= 0 ? "+" : "";
+  const cur = config.management.solMode ? "◎" : "$";
+  const reasonLine = reason ? `\nTrigger: <code>${reason}</code>` : "";
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `PnL: ${sign}${cur}${(pnlUsd ?? 0).toFixed(4)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)${reasonLine}`
   );
 }
 

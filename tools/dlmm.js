@@ -1324,6 +1324,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           fee_per_tvl_24h:    binData
             ? Math.round(parseFloat(binData.feePerTvl24h || 0) * 100) / 100
             : null,
+          volume_24h:         binData ? safeNum(binData.tradeVolume24h) ?? null : null,
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,

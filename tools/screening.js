@@ -592,7 +592,7 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
+export async function getTopCandidates({ limit = 10, mode = "strict" } = {}) {
   const { config } = await import("../config.js");
   const discovery = await discoverPools({ page_size: 50 });
   const { pools } = discovery;
@@ -606,27 +606,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const minTvl = Number(config.screening.minTvl ?? 0);
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
   const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
+  const isLoose = mode === "loose";
 
   const eligible = pools
     .filter((p) => {
-      const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
-      if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
-        return false;
-      }
-      if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
-        return false;
-      }
-      const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
-      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
-        pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
-        return false;
-      }
-      if (!isUsableVolatility(p.volatility)) {
-        pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
-        return false;
-      }
+      // Safety-only filters (always applied)
       if (occupiedPools.has(p.pool)) {
         pushFilteredReason(filteredOut, p, "already have an open position in this pool");
         return false;
@@ -645,25 +629,34 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, "token cooldown active");
         return false;
       }
+
+      // Strict-mode only filters (original behavior for CLI)
+      if (!isLoose) {
+        const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
+        if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
+          pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
+          return false;
+        }
+        if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
+          pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
+          return false;
+        }
+        const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
+        if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
+          pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
+          return false;
+        }
+        if (!isUsableVolatility(p.volatility)) {
+          pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
+          return false;
+        }
+      }
       return true;
     })
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
     .slice(0, limit);
 
-  if (config.screening.avoidPvpSymbols && eligible.length > 0) {
-    await enrichPvpRisk(eligible);
-    if (config.screening.blockPvpSymbols) {
-      const before = eligible.length;
-      const pvpRemoved = eligible.filter((p) => p.is_pvp);
-      pvpRemoved.forEach((p) => pushFilteredReason(filteredOut, p, "PVP hard filter"));
-      eligible.splice(0, eligible.length, ...eligible.filter((p) => !p.is_pvp));
-      if (eligible.length < before) {
-        log("screening", `PVP hard filter removed ${before - eligible.length} pool(s)`);
-      }
-    }
-  }
-
-  // Dev blocklist check — filter pools whose creator is on the blocklist
+  // Dev blocklist — always applied (safety)
   if (eligible.length > 0) {
     const before = eligible.length;
     const filtered = eligible.filter((p) => {
@@ -678,42 +671,63 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via dev blocklist`);
   }
 
-  if (config.indicators.enabled && eligible.length > 0) {
-    const confirmations = await Promise.all(
-      eligible.map(async (pool) => {
-        try {
-          const confirmation = await confirmIndicatorPreset({
-            mint: pool.base?.mint,
-            side: "entry",
-          });
-          return { pool: pool.pool, confirmation };
-        } catch (error) {
-          return {
-            pool: pool.pool,
-            confirmation: {
-              enabled: true,
-              confirmed: true,
-              skipped: true,
-              reason: `Indicator confirmation unavailable: ${error.message}`,
-              intervals: [],
-            },
-          };
+  // PVP and indicators only in strict mode
+  if (!isLoose) {
+    if (config.screening.avoidPvpSymbols && eligible.length > 0) {
+      await enrichPvpRisk(eligible);
+      if (config.screening.blockPvpSymbols) {
+        const before = eligible.length;
+        const pvpRemoved = eligible.filter((p) => p.is_pvp);
+        pvpRemoved.forEach((p) => pushFilteredReason(filteredOut, p, "PVP hard filter"));
+        eligible.splice(0, eligible.length, ...eligible.filter((p) => !p.is_pvp));
+        if (eligible.length < before) {
+          log("screening", `PVP hard filter removed ${before - eligible.length} pool(s)`);
         }
-      }),
-    );
-    const confirmationByPool = new Map(confirmations.map((entry) => [entry.pool, entry.confirmation]));
-    const before = eligible.length;
-    const confirmedEligible = eligible.filter((pool) => {
-      const confirmation = confirmationByPool.get(pool.pool);
-      pool.indicator_confirmation = confirmation || null;
-      if (!confirmation || confirmation.confirmed) return true;
-      pushFilteredReason(filteredOut, pool, `indicator reject: ${confirmation.reason}`);
-      log("screening", `Indicator rejected ${pool.name} (${pool.pool.slice(0, 8)}): ${confirmation.reason}`);
-      return false;
-    });
-    eligible.splice(0, eligible.length, ...confirmedEligible);
-    if (eligible.length < before) {
-      log("screening", `Indicator confirmation removed ${before - eligible.length} candidate(s)`);
+      }
+    }
+
+    if (config.indicators.enabled && eligible.length > 0) {
+      const confirmations = await Promise.all(
+        eligible.map(async (pool) => {
+          try {
+            const confirmation = await confirmIndicatorPreset({
+              mint: pool.base?.mint,
+              side: "entry",
+            });
+            return { pool: pool.pool, confirmation };
+          } catch (error) {
+            return {
+              pool: pool.pool,
+              confirmation: {
+                enabled: true,
+                confirmed: true,
+                skipped: true,
+                reason: `Indicator confirmation unavailable: ${error.message}`,
+                intervals: [],
+              },
+            };
+          }
+        }),
+      );
+      const confirmationByPool = new Map(confirmations.map((entry) => [entry.pool, entry.confirmation]));
+      const before = eligible.length;
+      const confirmedEligible = eligible.filter((pool) => {
+        const confirmation = confirmationByPool.get(pool.pool);
+        pool.indicator_confirmation = confirmation || null;
+        if (!confirmation || confirmation.confirmed) return true;
+        pushFilteredReason(filteredOut, pool, `indicator reject: ${confirmation.reason}`);
+        log("screening", `Indicator rejected ${pool.name} (${pool.pool.slice(0, 8)}): ${confirmation.reason}`);
+        return false;
+      });
+      eligible.splice(0, eligible.length, ...confirmedEligible);
+      if (eligible.length < before) {
+        log("screening", `Indicator confirmation removed ${before - eligible.length} candidate(s)`);
+      }
+    }
+  } else {
+    // Loose mode: enrich PVP as risk signal (not hard filter)
+    if (config.screening.avoidPvpSymbols && eligible.length > 0) {
+      await enrichPvpRisk(eligible);
     }
   }
 
