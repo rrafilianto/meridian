@@ -211,6 +211,18 @@ export function setPositionInstruction(position_address, instruction) {
 }
 
 /**
+ * Record that a periodic health review was performed for this position.
+ * Used by the management cycle to throttle LLM evaluations for STAY positions.
+ */
+export function setPeriodicReviewTime(position_address) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return;
+  pos.last_periodic_review_at = new Date().toISOString();
+  save(state);
+}
+
+/**
  * Raise the confirmed peak PnL only after `confirmTicks` consecutive polls where the
  * candidate stays above the current peak. With the 3s RPC poller this confirms a real
  * high in ~3-6s and prevents a single noisy tick from inflating the peak (which would

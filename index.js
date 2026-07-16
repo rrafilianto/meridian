@@ -25,7 +25,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal, setPeriodicReviewTime } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -306,6 +306,19 @@ export async function runManagementCycle({ silent = false } = {}) {
       actionMap.set(p.position, { action: "STAY" });
     }
 
+    // Periodic health review: STAY positions >= 60min get LLM evaluation
+    // (max once per 120min to avoid repeated calls every cycle)
+    for (const p of positionData) {
+      const act = actionMap.get(p.position);
+      if (act.action !== "STAY") continue;
+      if ((p.age_minutes ?? 0) < 60) continue;
+      const tracked = getTrackedPosition(p.position);
+      const lastReview = tracked?.last_periodic_review_at ? new Date(tracked.last_periodic_review_at).getTime() : 0;
+      if (lastReview && (Date.now() - lastReview) < 120 * 60 * 1000) continue;
+      actionMap.set(p.position, { action: "EVAL", rule: "review", reason: "periodic health review" });
+      log("state", `Scheduling periodic health review for ${p.pair} (age: ${p.age_minutes}m)`);
+    }
+
     // ── Build JS report ──────────────────────────────────────────────
     const totalValue = positionData.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
     const totalUnclaimed = positionData.reduce((s, p) => s + (p.unclaimed_fees_usd ?? 0), 0);
@@ -343,6 +356,13 @@ export async function runManagementCycle({ silent = false } = {}) {
     if (actionPositions.length > 0) {
       const execReport = await executeManagementActions(actionPositions, actionMap, { liveMessage, cur });
       if (execReport) mgmtReport += `\n\n${execReport}`;
+      // Record periodic review timestamps for review-EVAL positions
+      for (const p of actionPositions) {
+        const act = actionMap.get(p.position);
+        if (act.action === "EVAL" && act.rule === "review") {
+          setPeriodicReviewTime(p.position);
+        }
+      }
     } else {
       log("cron", "Management: all positions STAY — skipping");
       await liveMessage?.note("No tool actions needed.");
