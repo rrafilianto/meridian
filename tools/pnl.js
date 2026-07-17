@@ -82,6 +82,18 @@ export async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   }
 }
 
+// ─── Pool volume cache (fallback when Meteora PnL API returns 0) ──
+const _poolVolumeCache = new Map(); // pool -> { vol, at }
+export function _getCachedPoolVolume(poolAddress) {
+  const cached = _poolVolumeCache.get(poolAddress);
+  if (cached && Date.now() - cached.at < 300_000) return cached.vol;
+  // Fire-and-forget background fetch to populate cache for next time
+  fetch(`https://dlmm.datapi.meteora.ag/pools/${poolAddress}`).then(r => r.ok && r.json()).then(d => {
+    if (d) _poolVolumeCache.set(poolAddress, { vol: safeNum(d.volume?.['24h']) ?? null, at: Date.now() });
+  }).catch(() => {});
+  return null;
+}
+
 // ─── Jupiter prices (never cached) ──────────────────────────────
 async function getJupiterPrices(mints) {
   const list = unique(mints.map((m) => String(m).trim()));
@@ -232,7 +244,7 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     pnl_pct_diff:       pnlPctDiff != null ? round(pnlPctDiff, 2) : null,
     pnl_pct_suspicious: !!pnlPctSuspicious,
     fee_per_tvl_24h:    meteora ? Math.round(safeNum(meteora.feePerTvl24h) * 100) / 100 : null,
-    volume_24h:         meteora ? safeNum(meteora.tradeVolume24h) ?? null : null,
+    volume_24h:         meteora && safeNum(meteora.tradeVolume24h) != null ? safeNum(meteora.tradeVolume24h) : _getCachedPoolVolume(f.pool),
     age_minutes:        ageMinutes,
     minutes_out_of_range: minutesOutOfRange(f.position),
     instruction:        tracked?.instruction ?? null,

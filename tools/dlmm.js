@@ -29,7 +29,7 @@ import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
-import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { computePositions, fetchDlmmPnlForPool, _getCachedPoolVolume } from "./pnl.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -1324,7 +1324,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           fee_per_tvl_24h:    binData
             ? Math.round(parseFloat(binData.feePerTvl24h || 0) * 100) / 100
             : null,
-          volume_24h:         binData ? safeNum(binData.tradeVolume24h) ?? null : null,
+          volume_24h:         binData && safeNum(binData.tradeVolume24h) != null ? safeNum(binData.tradeVolume24h) : _getCachedPoolVolume(pool.poolAddress || pool.pool),
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,

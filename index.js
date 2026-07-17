@@ -212,7 +212,11 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
         const isNegativePnl = p.pnl_pct != null && p.pnl_pct < 0;
         blocks.push(`POSITION (EVAL): ${p.pair} (${p.position})`);
         blocks.push(`  issue: ${act.reason}`);
-        blocks.push(`  pnl: ${p.pnl_pct}% | unclaimed: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee/TVL: ${p.fee_per_tvl_24h ?? "?"}% | vol: $${p.volume_24h ?? "?"}`);
+        const tracked = getTrackedPosition(p.position);
+        const initFee = tracked?.initial_fee_tvl_24h;
+        const feeTrend = initFee != null ? `${initFee}% \u2192 ${p.fee_per_tvl_24h ?? "?"}%` : `${p.fee_per_tvl_24h ?? "?"}%`;
+        const accrualRate = p.age_minutes > 0 && p.unclaimed_fees_usd > 0 ? `${cur}${(p.unclaimed_fees_usd / p.age_minutes * 60).toFixed(4)}/hr` : "\u2014";
+        blocks.push(`  pnl: ${p.pnl_pct}% | fee/TVL: ${feeTrend} | accrual: ${accrualRate}`);
         blocks.push(`  bins: ${p.lower_bin}-${p.upper_bin} active=${p.active_bin} | OOR: ${p.minutes_out_of_range ?? 0}m${isOORDownside ? " (downside)" : ""}`);
         if (p.recall) blocks.push(`  pool ctx:\n${p.recall.split("\n").map(l => `    ${l}`).join("\n")}`);
         if (isOORDownside && isNegativePnl) {
@@ -224,7 +228,7 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
       blocks.push("");
     }
 
-    const prompt = `MANAGEMENT EVALUATION \u2014 ${llmPositions.length} position(s)\n\n${blocks.join("\n")}\nRULES:\n1. INSTRUCTION positions: condition MET \u2192 close_position (claims fees internally). NOT met \u2192 HOLD.\n2. EVAL positions (OOR/low yield/TP): use judgment with bias to hold.\n   - Fee/TVL still decent + volume healthy \u2192 HOLD, price may return to range\n   - Pool dying / yield collapsed / no recovery sign \u2192 close_position\n   - OOR downside (below range) + negative PnL \u2192 DO NOT close. These positions can pump back into range when price recovers. HOLD unless fee/TVL is near zero AND volume is /bin/zsh.\n3. After ANY close: swap base tokens to SOL (if worth >= $0.10).\n4. Do NOT call claim_fees before close_position \u2014 it's handled internally.\n\nWrite one brief result line per position after acting (or HOLD).`;
+    const prompt = `MANAGEMENT EVALUATION \u2014 ${llmPositions.length} position(s)\n\n${blocks.join("\n")}\nRULES:\n1. INSTRUCTION positions: condition MET \u2192 close_position (claims fees internally). NOT met \u2192 HOLD.\n2. EVAL positions (OOR/low yield/TP): use judgment with bias to hold.\n   - Fee/TVL still decent + fee trend stable/improving \u2192 HOLD, price may return to range\n   - Pool dying / yield collapsed / no recovery sign \u2192 close_position\n   - OOR downside (below range) + negative PnL \u2192 DO NOT close. These positions can pump back into range when price recovers. HOLD unless fee/TVL is near zero AND accrual is /bin/zsh/hr.\n3. After ANY close: swap base tokens to SOL (if worth >= $0.10).\n4. Do NOT call claim_fees before close_position \u2014 it's handled internally.\n\nWrite one brief result line per position after acting (or HOLD).`;
 
     const { content } = await agentLoop(prompt, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, config.llm.maxTokens, {
       onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
