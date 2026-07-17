@@ -221,11 +221,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             attempt -= 1;
             continue;
           }
-          if (toolChoice === "required" && isToolChoiceRequiredError(error)) {
-            toolChoice = "auto";
-            log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
-            attempt -= 1;
-            continue;
+          if (toolChoice === "required") {
+            if (isToolChoiceRequiredError(error) || /Error from provider/i.test(error?.message || "")) {
+              toolChoice = "auto";
+              log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
+              attempt -= 1;
+              continue;
+            }
           }
           if (!omitToolChoice && isThinkingModeToolChoiceError(error)) {
             omitToolChoice = true;
@@ -281,9 +283,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
-        // Hermes sometimes returns null content — pop the empty message and retry once
-        if (!msg.content) {
-          messages.pop(); // remove the empty assistant message
+        // Reasoning models may return content in reasoning_content field — wait for actual output
+        if (!msg.content && !msg.tool_calls?.length) {
+          if (msg.reasoning_content) {
+            log("agent", "Reasoning model in progress, awaiting tool call...");
+            continue;
+          }
+          messages.pop();
           log("agent", "Empty response, retrying...");
           continue;
         }

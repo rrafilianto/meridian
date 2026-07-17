@@ -208,19 +208,25 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
         blocks.push(`  note: "${p.instruction}"`);
         blocks.push(`  \u2192 If note condition is MET, call close_position. Otherwise HOLD.`);
       } else {
+        const isOORDownside = p.active_bin != null && p.lower_bin != null && p.active_bin < p.lower_bin;
+        const isNegativePnl = p.pnl_pct != null && p.pnl_pct < 0;
         blocks.push(`POSITION (EVAL): ${p.pair} (${p.position})`);
         blocks.push(`  issue: ${act.reason}`);
         blocks.push(`  pnl: ${p.pnl_pct}% | unclaimed: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee/TVL: ${p.fee_per_tvl_24h ?? "?"}% | vol: $${p.volume_24h ?? "?"}`);
-        blocks.push(`  bins: ${p.lower_bin}-${p.upper_bin} active=${p.active_bin} | OOR: ${p.minutes_out_of_range ?? 0}m`);
+        blocks.push(`  bins: ${p.lower_bin}-${p.upper_bin} active=${p.active_bin} | OOR: ${p.minutes_out_of_range ?? 0}m${isOORDownside ? " (downside)" : ""}`);
         if (p.recall) blocks.push(`  pool ctx:\n${p.recall.split("\n").map(l => `    ${l}`).join("\n")}`);
-        blocks.push(`  \u2192 Decide: close_position or HOLD? BIAS TO HOLD. Only close if pool is dying or recovery is unlikely.`);
+        if (isOORDownside && isNegativePnl) {
+          blocks.push(`  \u2192 HOLD. OOR downside + negative PnL. Price may pump back into range.`);
+        } else {
+          blocks.push(`  \u2192 Decide: close_position or HOLD? BIAS TO HOLD. Only close if pool is dying or recovery is unlikely.`);
+        }
       }
       blocks.push("");
     }
 
-    const prompt = `MANAGEMENT EVALUATION \u2014 ${llmPositions.length} position(s)\n\n${blocks.join("\n")}\nRULES:\n1. INSTRUCTION positions: condition MET \u2192 close_position (claims fees internally). NOT met \u2192 HOLD.\n2. EVAL positions (OOR/low yield/TP): use judgment with bias to hold.\n   - Fee/TVL still decent + volume healthy \u2192 HOLD, price may return to range\n   - Pool dying / yield collapsed / no recovery sign \u2192 close_position\n3. After ANY close: swap base tokens to SOL (if worth >= $0.10).\n4. Do NOT call claim_fees before close_position \u2014 it's handled internally.\n\nWrite one brief result line per position after acting (or HOLD).`;
+    const prompt = `MANAGEMENT EVALUATION \u2014 ${llmPositions.length} position(s)\n\n${blocks.join("\n")}\nRULES:\n1. INSTRUCTION positions: condition MET \u2192 close_position (claims fees internally). NOT met \u2192 HOLD.\n2. EVAL positions (OOR/low yield/TP): use judgment with bias to hold.\n   - Fee/TVL still decent + volume healthy \u2192 HOLD, price may return to range\n   - Pool dying / yield collapsed / no recovery sign \u2192 close_position\n   - OOR downside (below range) + negative PnL \u2192 DO NOT close. These positions can pump back into range when price recovers. HOLD unless fee/TVL is near zero AND volume is /bin/zsh.\n3. After ANY close: swap base tokens to SOL (if worth >= $0.10).\n4. Do NOT call claim_fees before close_position \u2014 it's handled internally.\n\nWrite one brief result line per position after acting (or HOLD).`;
 
-    const { content } = await agentLoop(prompt, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
+    const { content } = await agentLoop(prompt, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, config.llm.maxTokens, {
       onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
       onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
     });
@@ -654,7 +660,7 @@ STEPS:
 IMPORTANT:
 - Keep the whole report compact and highly scannable for Telegram.
 - Filters like bots%, top10%, fee_ratio, TVL are now risk SIGNALS, not hard blocks. Use your judgment based on past lessons.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
+      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, config.llm.maxTokens, {
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
